@@ -1,0 +1,1 @@
+Refactor version of George Hotz's [teenygrad](https://github.com/tinygrad/teenygrad). Focus not on minimizing the count of lines but the understandability of the code.
