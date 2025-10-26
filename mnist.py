@@ -5,7 +5,7 @@ from tqdm import trange
 import gzip, os
 
 from teenygrad.nn import optim
-from teenygrad.helpers import getenv
+from teenygrad.helpers import getenv, dtypes
 
 
 def train(model,
@@ -28,7 +28,7 @@ def train(model,
         # network
         out = model.forward(x) if hasattr(model, 'forward') else model(x)
 
-        loss = lossfn(out, y)
+        loss = lossfn(out, y.cast(dtype=dtypes.int8))
         optim.zero_grad()
         loss.backward()
         if noloss: del loss

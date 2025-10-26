@@ -446,34 +446,66 @@ class Tensor:
         for i, v in enumerate(orig_slices):
             count[type(v)].append(i)
 
-        if (num_slices := len(count[int]) + len(count[slice]) + len(count[Tensor])) > len(self.shape):
+        num_slices = len(count[int]) + len(count[slice]) + len(count[Tensor])
+        if num_slices > len(self.shape):
             raise IndexError(f"too many indices for tensor of dimension {len(self.shape)}")
-        if len(ellipsis_found := count[type(Ellipsis)]) > 1:
+
+        ellipsis_found = count[type(Ellipsis)]
+        if len(ellipsis_found) > 1:
             raise IndexError("an index can only have a single ellipsis ('...')")
 
         ellipsis_idx = ellipsis_found[0] if ellipsis_found else len(orig_slices)
-        orig_slices[ellipsis_idx:ellipsis_idx + 1] = [slice(None)] * (len(self.shape) - num_slices)
+        ell_fill = [slice(None)] * (len(self.shape) - num_slices)
+        orig_slices[ellipsis_idx:ellipsis_idx + 1] = ell_fill
 
         valid_slices = [v for v in orig_slices if v is not None]
-        valid_slices = [v if isinstance(v, slice) else slice(y_ := normalize_int(v, i, dim_sz), y_ + 1) if isinstance(v, int) else slice(None)
-                        for i, (v, dim_sz) in enumerate(zip(valid_slices, self.shape))]
+        norm_slices = []
+        for i, (v, dim_sz) in enumerate(zip(valid_slices, self.shape)):
+            if isinstance(v, slice):
+                norm_slices.append(v)
+            elif isinstance(v, int):
+                norm_int = normalize_int(v, i, dim_sz)
+                norm_slices.append(slice(norm_int, norm_int + 1))
+            else:
+                norm_slices.append(slice(None))
+        valid_slices = norm_slices
 
-        start, stop, strides = zip(*y) if (y := [s.indices(dim_sz) for s, dim_sz in zip(valid_slices, self.shape)]) else ((), (), ())
-        new_slice = tuple(((0, 0) if e < s else (s, e)) if st > 0 else ((0, 0) if e > s else (e + 1, s + 1))
-                          for s, e, st in zip(start, stop, strides))
-        sliced_tensor = self.shrink(new_slice).flip(axis=[i for i, s in enumerate(strides) if s < 0])
-        new_shape = sliced_tensor.shape
+        indices = [s.indices(dim_sz) for s, dim_sz in zip(valid_slices, self.shape)]
+        if indices:
+            start, stop, strides = zip(*indices)
+        else:
+            start, stop, strides = (), (), ()
+
+        new_slice = []
+        for s, e, st in zip(start, stop, strides):
+            if st > 0:
+                slc_range = (0, 0) if e < s else (s, e)
+            else:
+                slc_range = (0, 0) if e > s else (e + 1, s + 1)
+            new_slice.append(slc_range)
+        new_slice = tuple(new_slice)
+
+        flip_axes = [i for i, s in enumerate(strides) if s < 0]
+        sliced = self.shrink(new_slice).flip(axis=flip_axes)
+        new_shape = sliced.shape
+
         if any(abs(s) != 1 for s in strides):
             strides = tuple(abs(s) for s in strides)
             # Pad: add pad at the end: [dim_sz] -> [dim_sz_padded]
-            padded_tensor = sliced_tensor.pad(tuple(
-                (0, s - (dim_sz % s) if dim_sz % s != 0 else 0) for s, dim_sz in zip(strides, sliced_tensor.shape)))
+            padding = []
+            for s, dim_sz in zip(strides, sliced.shape):
+                pad_right = s - (dim_sz % s) if dim_sz % s != 0 else 0
+                padding.append((0, pad_right))
+            padded = sliced.pad(tuple(padding))
+
             # Reshape: [dim_sz_padded] -> [dim_sz_padded // s, s]
-            reshaped_tensor = padded_tensor.reshape(
-                flatten([sh // s, s] for sh, s in zip(padded_tensor.shape, strides)))
-            new_shape = reshaped_tensor.shape[::2]
+            reshapes = [[sh // s, s] for sh, s in zip(padded.shape, strides)]
+            reshaped = padded.reshape(flatten(reshapes))
+            new_shape = reshaped.shape[::2]
+
             # Shrink: do [:, 0]
-            sliced_tensor = reshaped_tensor.shrink(tuple(flatten(((0, sh), (0, 1)) for sh in new_shape)))
+            shrinks = [((0, sh), (0, 1)) for sh in new_shape]
+            sliced = reshaped.shrink(tuple(flatten(shrinks)))
 
         final_shape, it_shape, dim, tensors, dim_collapsed = [], iter(new_shape), [], [], 0
         for i, s in enumerate(orig_slices):
@@ -489,28 +521,59 @@ class Tensor:
                     if isinstance(s, Tensor):
                         tensors.append(s)
                         dim.append(i - dim_collapsed)
-        ret = sliced_tensor.reshape(tuple(final_shape))
+        ret = sliced.reshape(tuple(final_shape))
 
         if tensors:  # Fancy/tensor indexing
             # normalize idx
             # TODO: first contiguous fixes torch+cpu_only CI, but it causes llvm to fail. Second one fixes llvm
-            idx = [t.sign().contiguous().__neg__().contiguous().relu() * ret.shape[d] + t for d, t in zip(dim, tensors)]
+            idx = []
+            for d, t in zip(dim, tensors):
+                neg_mask = t.sign().contiguous().__neg__().contiguous().relu()
+                norm_idx = neg_mask * ret.shape[d] + t
+                idx.append(norm_idx)
+
             max_dim = max(i.ndim for i in idx)
+
             # compute sum_dim, arange, and idx
             sum_dim = [d if n == 0 else d + max_dim - n for n, d in enumerate(dim)]
-            arange = [Tensor.arange(ret.shape[d], dtype=dtypes.int32, requires_grad=False, device=self.device).reshape(*[1] * sd, ret.shape[d], *[1] * (ret.ndim + max_dim - n - sd - 1))
-                      for n, (sd, d) in enumerate(zip(sum_dim, dim))]
-            first_idx = [idx[0].reshape(*[1] * dim[0], *[1] * (1 + max_dim - idx[0].ndim), *idx[0].shape, *[1] * (ret.ndim - dim[0] - 1))]
-            rest_idx = [i.reshape(*[1] * dim[0], *[1] * (max_dim - i.ndim), *i.shape, *[1] * (ret.ndim - dim[0] - n))
-                        for n, i in enumerate(idx[1:], 1)]
+
+            arange = []
+            for n, (sd, d) in enumerate(zip(sum_dim, dim)):
+                lead_ones = [1] * sd
+                trail_ones = [1] * (ret.ndim + max_dim - n - sd - 1)
+                ar_shape = (*lead_ones, ret.shape[d], *trail_ones)
+                ar = Tensor.arange(ret.shape[d], dtype=dtypes.int32, requires_grad=False, device=self.device)
+                arange.append(ar.reshape(*ar_shape))
+
+            first_lead = [1] * dim[0]
+            first_mid = [1] * (1 + max_dim - idx[0].ndim)
+            first_trail = [1] * (ret.ndim - dim[0] - 1)
+            first_shape = (*first_lead, *first_mid, *idx[0].shape, *first_trail)
+            first_idx = [idx[0].reshape(*first_shape)]
+
+            rest_idx = []
+            for n, i in enumerate(idx[1:], 1):
+                rest_lead = [1] * dim[0]
+                rest_mid = [1] * (max_dim - i.ndim)
+                rest_trail = [1] * (ret.ndim - dim[0] - n)
+                rest_shape = (*rest_lead, *rest_mid, *i.shape, *rest_trail)
+                rest_idx.append(i.reshape(*rest_shape))
+
             idx = first_idx + rest_idx
-            ret = ret.reshape(*ret.shape[:sum_dim[0] + 1], *[1] * max_dim, *ret.shape[sum_dim[0] + 1:])
+
+            ret_shape = (*ret.shape[:sum_dim[0] + 1], *[1] * max_dim, *ret.shape[sum_dim[0] + 1:])
+            ret = ret.reshape(*ret_shape)
+
             # iteratively fancy index
-            for a, i, sd in zip(arange, idx, sum_dim): ret = (a == i).mul(ret).sum(sd)
+            for a, i, sd in zip(arange, idx, sum_dim):
+                ret = (a == i).mul(ret).sum(sd)
+
             # special permute case
-            if dim[0] != 0 and len(dim) != 1 and dim != list(range(dim[0], dim[-1] + 1)):
+            non_consec = dim != list(range(dim[0], dim[-1] + 1))
+            if dim[0] != 0 and len(dim) != 1 and non_consec:
                 ret_dims = list(range(ret.ndim))
-                ret = ret.permute(ret_dims[dim[0]:dim[0] + max_dim] + ret_dims[:dim[0]] + ret_dims[dim[0] + max_dim:])
+                perm_order = ret_dims[dim[0]:dim[0] + max_dim] + ret_dims[:dim[0]] + ret_dims[dim[0] + max_dim:]
+                ret = ret.permute(perm_order)
 
         return ret
 
@@ -690,220 +753,6 @@ class Tensor:
 
     def argmin(self, axis=None, keepdim=False):
         return (-self).argmax(axis=axis, keepdim=keepdim)
-
-    # ***** processing ops *****
-
-    def _pool(self,
-              k_: Tuple[sint, ...],
-              stride: Union[Tuple[int, ...], int] = 1,
-              dilation: Union[Tuple[int, ...], int] = 1) -> Tensor:
-        assert len(self.shape) >= len(k_), f"can't pool {self.shape} with {k_}"
-        assert all_int(self.shape) and all_int(k_), f"does not support symbolic {self.shape=}, {k_=}"
-
-        s_, d_ = make_pair(stride, len(k_)), make_pair(dilation, len(k_))
-        assert len(k_) == len(s_) and len(k_) == len(d_), f"stride/dilation mismatch kernel:{k_} stride:{s_} dilation:{d_}"
-
-        slc_prefix, prefix, i_ = [(0, x) for x in self.shape[0:-len(k_)]], self.shape[0:-len(k_)], self.shape[-len(k_):]
-
-        if any(k > s for k, s in zip(k_, s_)) or any(d != 1 for d in d_):
-            o_ = [(i - d * (k - 1) - 1) // s + 1 for i, d, k, s in zip(i_, d_, k_, s_)]
-            e_ = [math.ceil(k * (i + d) / i) for k, i, d in zip(k_, i_, d_)]  # expands such that we don't need padding
-            xup = self.reshape(*prefix, *flatten((1, i) for i in i_)).expand(*prefix, *flatten((e, i) for e, i in zip(e_, i_))).reshape(*prefix, *[e * i for e, i in zip(e_, i_)])
-
-            # slide by dilation
-            xup = xup.slice(slc_prefix + [(0, k * (i + d)) for k, i, d in zip(k_, i_, d_)])
-            xup = xup.reshape(*prefix, *flatten((k, i + d) for k, i, d in zip(k_, i_, d_)))
-            xup = xup.slice(slc_prefix + flatten(((0, k), (0, o * s)) for k, o, s in zip(k_, o_, s_)))
-
-            # handle stride, and permute to move reduce to the end
-            xup = xup.reshape(*prefix, *flatten((k, o, s) for k, o, s in zip(k_, o_, s_)))
-            xup = xup.slice(slc_prefix + flatten(((0, k), (0, o), (0, 1)) for k, o in zip(k_, o_)))
-            xup = xup.reshape(*prefix, *flatten((k, o) for k, o in zip(k_, o_)))
-            return xup.permute(*range(len(prefix)), *[len(prefix) + i * 2 + 1 for i in range(len(k_))], *[len(prefix) + i * 2 for i in range(len(k_))])
-
-        # TODO: once the shapetracker can optimize well, remove this alternative implementation. or not if the CPU implementation doesn't use ShapeTracker
-        o_ = [(i + (s - k)) // s for i, s, k in zip(i_, s_, k_)]
-        xup = self.slice(slc_prefix + [(0, o * s) for o, s in zip(o_, s_)])
-        xup = xup.reshape(*prefix, *flatten(((o, s) for o, s in zip(o_, s_))))
-        xup = xup.slice(slc_prefix + flatten(((0, o), (0, k)) for o, k in zip(o_, k_)))
-        return xup.permute(*range(len(prefix)), *[len(prefix) + i * 2 for i in range(len(k_))], *[len(prefix) + i * 2 + 1 for i in range(len(k_))])
-
-        # NOTE: these work for more than 2D
-
-    def avg_pool2d(self, kernel_size=(2, 2), stride=None, dilation=1):
-        return self._pool(make_pair(kernel_size), stride if stride is not None else kernel_size, dilation).mean(axis=tuple(range(0 - len(make_pair(kernel_size)), 0)))
-
-    def max_pool2d(self, kernel_size=(2, 2), stride=None, dilation=1):
-        return self._pool(make_pair(kernel_size), stride if stride is not None else kernel_size, dilation).max(axis=tuple(range(0 - len(make_pair(kernel_size)), 0)))
-
-    def conv_transpose2d(self,
-                         weight: Tensor,
-                         bias: Optional[Tensor] = None,
-                         groups=1,
-                         stride=1,
-                         dilation=1,
-                         padding=0,
-                         output_padding=0) -> Tensor:
-        HW = weight.shape[2:]
-        trailing = list(range(3, len(weight.shape) + 1))
-
-        w_grouped = weight.reshape(groups, weight.shape[0] // groups, weight.shape[1], *weight.shape[2:])
-        w_permuted = w_grouped.permute(0, 2, 1, *trailing)
-        w = w_permuted.flip(trailing)
-
-        x = self
-        stride = make_pair(stride, len(HW))
-
-        if any(s > 1 for s in stride):
-            x_expanded = x.reshape(*x.shape[:2], *flatten((k, 1) for k in x.shape[2:]))
-            pad_spec = ((0, 0), (0, 0), *flatten(((0, 0), (0, s - 1)) for s in stride))
-            x_padded = x_expanded.pad(pad_spec)
-            new_dims = [k * s for k, s in zip(x_padded.shape[2::2], stride)]
-            x_merged = x_padded.reshape(*x_padded.shape[:2], *new_dims)
-            shrink_spec = ((0, x_merged.shape[0]), (0, x_merged.shape[1]), *[(0, k - (s - 1)) for k, s in zip(x_merged.shape[2:], stride)])
-            x = x_merged.shrink(shrink_spec)
-
-        dilation_pair = make_pair(dilation, len(HW))
-        padding_pair = make_pair(padding, len(HW))
-        output_pad_pair = make_pair(output_padding, len(HW))
-        padding_calc = (((k - 1) * d - p, (k - 1) * d - p + op)
-                        for k, d, p, op in reversed(list(zip(HW, dilation_pair, padding_pair, output_pad_pair))))
-        padding = flatten(padding_calc)
-
-        w_merged = w.reshape(w.shape[0] * w.shape[1], *w.shape[2:])
-        return x.conv2d(w_merged, groups=groups, bias=bias, dilation=dilation, padding=padding)
-
-    wino = int(getenv("WINO", "0"))
-
-    def conv2d(self,
-               weight: Tensor,
-               bias: Optional[Tensor] = None,
-               groups=1,
-               stride=1,
-               dilation=1,
-               padding=0) -> Tensor:
-        bs, cin_ = self.shape[:2]
-        cout, cin = weight.shape[:2]
-        HW = weight.shape[2:]
-
-        assert groups * cin == cin_ and len(self.shape) == len(weight.shape), f"Input Tensor shape {self.shape} does not match the shape of the weights {weight.shape}. ({groups * cin} vs. {cin_})"
-        if isinstance(padding, (tuple, list)):
-            assert len(padding) == 2 * len(HW) or len(padding) == len(HW), f"Expected padding of length {2 * len(HW)} or {len(HW)}, but got {len(padding)} for tensor of shape {self.shape}"
-
-        if isinstance(padding, int):
-            padding_ = [padding] * 2 * len(HW)
-        elif len(padding) == 2 * len(HW):
-            padding_ = padding
-        else:
-            padding_ = [p for p in padding for _ in range(2)][::-1]
-
-        # conv2d is a pooling op (with padding)
-        x_padded = self.pad2d(padding_)
-        x = x_padded._pool(HW, stride, dilation)  # (bs, groups*cin, oy, ox, H, W)
-        rcout = cout // groups
-        oyx = x.shape[2:-len(HW)]
-
-        use_winograd = all(k == 3 for k in HW) and stride == 1 and dilation == 1 and Tensor.wino
-        if not use_winograd:
-            # normal conv
-            x_reshaped = x.reshape(bs, groups, cin, 1, *oyx, *HW)
-            x_expanded = x_reshaped.expand(bs, groups, cin, rcout, *oyx, *HW)
-            perm_order = [0, 1, 3, *[4 + i for i in range(len(oyx))], 2, *[4 + len(oyx) + i for i in range(len(HW))]]
-            x = x_expanded.permute(*perm_order)
-
-            # conv! broadcasted to (bs, groups, rcout, *oyx, cin, *HW)
-            w_reshaped = weight.reshape(1, groups, rcout, *[1] * len(oyx), cin, *HW)
-            multiplied = x * w_reshaped
-            sum_axes = [-1 - i for i in range(1 + len(oyx))]
-            summed = multiplied.sum(sum_axes, keepdim=True)
-            ret = summed.reshape(bs, cout, *oyx)
-
-            if bias is None:
-                return ret
-            else:
-                bias_reshaped = bias.reshape(1, -1, *[1] * len(HW))
-                return ret.add(bias_reshaped)
-
-        # winograd conv 3 kernel f(4x4,3x3) see: http://arxiv.org/abs/1509.09308
-
-        def apply_matrix(mat, t, dim=0):
-            if dim == len(HW):
-                return t
-            stacked = [apply_matrix(mat, sum(mm * t[j] for j, mm in enumerate(m) if mm), dim=dim + 1) for m in mat]
-            return Tensor.stack(stacked)
-
-        HWI, HWO = (6,) * len(HW), (4,) * len(HW)  # F(4x4,3x3) winograd tiles
-        winograd_Bt = [
-            [4, 0, -5, 0, 1, 0],
-            [0, -4, -4, 1, 1, 0],
-            [0, 4, -4, -1, 1, 0],
-            [0, -2, -1, 2, 1, 0],
-            [0, 2, -1, -2, 1, 0],
-            [0, 4, 0, -5, 0, 1]
-        ]
-        winograd_G = [
-            [1 / 4, 0, 0],
-            [-1 / 6, -1 / 6, -1 / 6],
-            [-1 / 6, 1 / 6, -1 / 6],
-            [1 / 24, 1 / 12, 1 / 6],
-            [1 / 24, -1 / 12, 1 / 6],
-            [0, 0, 1]
-        ]
-        winograd_At = [
-            [1, 1, 1, 1, 1, 0],
-            [0, 1, -1, 2, -2, 0],
-            [0, 1, 1, 4, 4, 0],
-            [0, 1, -1, 8, -8, 1]
-        ]  # applying At in pre-order almost doubles compilation time
-
-        # todo: stride == dilation
-        # use padding to round up to 4x4 output tiles
-        tile_pad = []
-        for i, dim in enumerate(self.shape[-len(HW):]):
-            left_pad = padding_[i * 2]
-            right_base = padding_[i * 2 + 1]
-            pad_sum = sum(padding_[i * 2:(i + 1) * 2])
-            extra_pad = (-(dim + pad_sum - 2) % 4)
-            right_pad = right_base + extra_pad
-            tile_pad.extend([left_pad, right_pad])
-
-        d_padded = self.pad2d(tile_pad)
-        d_pooled = d_padded._pool(HWI, HWO)  # (bs, cin_, tyx, HWI)
-        perm_front = list(range(len(d_pooled.shape) - len(HW), len(d_pooled.shape)))
-        perm_rest = list(range(len(d_pooled.shape) - len(HW)))
-        d = d_pooled.permute(*perm_front, *perm_rest).contiguous_backward()  # move HW to the front: (HWI, bs, cin_, tyx)
-        tyx = d.shape[-len(HWI):]  # dim of tiling
-
-        g_perm_front = list(range(len(weight.shape) - len(HW), len(weight.shape)))
-        g_perm_rest = list(range(len(weight.shape) - len(HW)))
-        g = weight.permute(*g_perm_front, *g_perm_rest)  # move HW to the front
-
-        # compute 6x6 winograd tiles: GgGt, BtdB
-        g_transformed = apply_matrix(winograd_G, g).contiguous()
-        gfactors = g_transformed.reshape(*HWI, 1, groups, rcout, cin, *([1] * len(tyx)))  # (HWI, groups * rcout, cin) -> (HWI, bs=1, groups, rcout, cin, tyx=(1,1))
-
-        d_transformed = apply_matrix(winograd_Bt, d).contiguous()
-        dfactors = d_transformed.reshape(*HWI, bs, groups, 1, cin, *tyx)  # (HWI, bs, cin_, tyx) -> (HWI, bs, groups, 1 ,cin, *tyx)
-
-        product = gfactors * dfactors
-        sum_axis = -1 - len(HW)
-        product_summed = product.sum(axis=sum_axis)
-        ret = apply_matrix(winograd_At, product_summed)  # matmul; sum across cin: (HWI, bs, groups, rcout, *tyx); then HWI -> HWO: (HWO, bs, groups, rcout, *tyx)
-
-        interleave_order = [*range(len(HW), len(ret.shape) - len(HW)),
-                            *[i + o for i in range(len(HW)) for o in [len(ret.shape) - len(HW), 0]]]
-        ret_permuted = ret.permute(interleave_order)  # interleave tyx and HWO: (bs, groups, rcout, oy, HO, ox, WO)
-
-        merged_shape = [bs, cout, *[c * HWO[i] for i, c in enumerate(tyx)]]
-        ret_merged = ret_permuted.reshape(*merged_shape)
-        shrink_spec = tuple((0, s) for s in [bs, cout, *oyx])
-        ret = ret_merged.shrink(shrink_spec)  # merge groups and rcout, tyx and HWO: (bs, groups, cout, *yx), shrink to final
-
-        if bias is not None:
-            bias_reshaped = bias.reshape(1, -1, *[1 for _ in range(len(HW))])
-            ret = ret.add(bias_reshaped)
-
-        return ret.contiguous().contiguous_backward()
 
     def dot(self, w: Tensor) -> Tensor:
         n1, n2 = len(self.shape), len(w.shape)
@@ -1316,7 +1165,12 @@ class Tensor:
         mask = (Tensor.rand(*self.shape, requires_grad=False, device=self.device) >= p).cast(dtypes.bool)
         return self * mask * (1 / (1.0 - p))
 
-    def scaled_dot_product_attention(self, key: Tensor, value: Tensor, attn_mask: Optional[Tensor] = None, dropout_p: float = 0.0, is_causal: bool = False) -> Tensor:
+    def scaled_dot_product_attention(self,
+                                     key: Tensor,
+                                     value: Tensor,
+                                     attn_mask: Optional[Tensor] = None,
+                                     dropout_p: float = 0.0,
+                                     is_causal: bool = False) -> Tensor:
         # NOTE: it works if key, value have symbolic shape
         assert all_int(self.shape), f"does not support symbolic shape {self.shape}"
 
@@ -1336,6 +1190,265 @@ class Tensor:
         weights = masked.softmax(-1)
         dropped = weights.dropout(dropout_p)
         return dropped @ value
+
+    # ***** processing ops *****
+
+    def _pool(self,
+              k_: Tuple[sint, ...],
+              stride: Union[Tuple[int, ...], int] = 1,
+              dilation: Union[Tuple[int, ...], int] = 1) -> Tensor:
+        assert len(self.shape) >= len(k_), f"can't pool {self.shape} with {k_}"
+        assert all_int(self.shape) and all_int(k_), f"does not support symbolic {self.shape=}, {k_=}"
+
+        s_, d_ = make_pair(stride, len(k_)), make_pair(dilation, len(k_))
+        assert len(k_) == len(s_) and len(k_) == len(
+            d_), f"stride/dilation mismatch kernel:{k_} stride:{s_} dilation:{d_}"
+
+        slc_prefix = [(0, x) for x in self.shape[0:-len(k_)]]
+        prefix = self.shape[0:-len(k_)]
+        i_ = self.shape[-len(k_):]
+
+        if any(k > s for k, s in zip(k_, s_)) or any(d != 1 for d in d_):
+            o_ = [(i - d * (k - 1) - 1) // s + 1 for i, d, k, s in zip(i_, d_, k_, s_)]
+            e_ = [math.ceil(k * (i + d) / i) for k, i, d in
+                  zip(k_, i_, d_)]  # expands such that we don't need padding
+
+            reshape_dims = (*prefix, *flatten((1, i) for i in i_))
+            expand_dims = (*prefix, *flatten((e, i) for e, i in zip(e_, i_)))
+            final_dims = (*prefix, *[e * i for e, i in zip(e_, i_)])
+            xup = self.reshape(*reshape_dims).expand(*expand_dims).reshape(*final_dims)
+
+            # slide by dilation
+            slice_dims = slc_prefix + [(0, k * (i + d)) for k, i, d in zip(k_, i_, d_)]
+            xup = xup.slice(slice_dims)
+
+            reshape_dims = (*prefix, *flatten((k, i + d) for k, i, d in zip(k_, i_, d_)))
+            xup = xup.reshape(*reshape_dims)
+
+            slice_dims = slc_prefix + flatten(((0, k), (0, o * s)) for k, o, s in zip(k_, o_, s_))
+            xup = xup.slice(slice_dims)
+
+            # handle stride, and permute to move reduce to the end
+            reshape_dims = (*prefix, *flatten((k, o, s) for k, o, s in zip(k_, o_, s_)))
+            xup = xup.reshape(*reshape_dims)
+
+            slice_dims = slc_prefix + flatten(((0, k), (0, o), (0, 1)) for k, o in zip(k_, o_))
+            xup = xup.slice(slice_dims)
+
+            reshape_dims = (*prefix, *flatten((k, o) for k, o in zip(k_, o_)))
+            xup = xup.reshape(*reshape_dims)
+
+            prefix_indices = list(range(len(prefix)))
+            output_indices = [len(prefix) + i * 2 + 1 for i in range(len(k_))]
+            kernel_indices = [len(prefix) + i * 2 for i in range(len(k_))]
+            return xup.permute(*prefix_indices, *output_indices, *kernel_indices)
+
+        # TODO: once the shapetracker can optimize well, remove this alternative implementation. or not if the CPU implementation doesn't use ShapeTracker
+        o_ = [(i + (s - k)) // s for i, s, k in zip(i_, s_, k_)]
+
+        slice_dims = slc_prefix + [(0, o * s) for o, s in zip(o_, s_)]
+        xup = self.slice(slice_dims)
+
+        reshape_dims = (*prefix, *flatten(((o, s) for o, s in zip(o_, s_))))
+        xup = xup.reshape(*reshape_dims)
+
+        slice_dims = slc_prefix + flatten(((0, o), (0, k)) for o, k in zip(o_, k_))
+        xup = xup.slice(slice_dims)
+
+        prefix_indices = list(range(len(prefix)))
+        output_indices = [len(prefix) + i * 2 for i in range(len(k_))]
+        kernel_indices = [len(prefix) + i * 2 + 1 for i in range(len(k_))]
+        return xup.permute(*prefix_indices, *output_indices, *kernel_indices)
+
+        # NOTE: these work for more than 2D
+
+    def avg_pool2d(self, kernel_size=(2, 2), stride=None, dilation=1):
+        return self._pool(make_pair(kernel_size), stride if stride is not None else kernel_size, dilation).mean(
+            axis=tuple(range(0 - len(make_pair(kernel_size)), 0)))
+
+    def max_pool2d(self, kernel_size=(2, 2), stride=None, dilation=1):
+        return self._pool(make_pair(kernel_size), stride if stride is not None else kernel_size, dilation).max(
+            axis=tuple(range(0 - len(make_pair(kernel_size)), 0)))
+
+    def conv_transpose2d(self,
+                         weight: Tensor,
+                         bias: Optional[Tensor] = None,
+                         groups=1,
+                         stride=1,
+                         dilation=1,
+                         padding=0,
+                         output_padding=0) -> Tensor:
+        HW = weight.shape[2:]
+        trailing = list(range(3, len(weight.shape) + 1))
+
+        w_grouped = weight.reshape(groups, weight.shape[0] // groups, weight.shape[1], *weight.shape[2:])
+        w_permuted = w_grouped.permute(0, 2, 1, *trailing)
+        w = w_permuted.flip(trailing)
+
+        x = self
+        stride = make_pair(stride, len(HW))
+
+        if any(s > 1 for s in stride):
+            x_expanded = x.reshape(*x.shape[:2], *flatten((k, 1) for k in x.shape[2:]))
+            pad_spec = ((0, 0), (0, 0), *flatten(((0, 0), (0, s - 1)) for s in stride))
+            x_padded = x_expanded.pad(pad_spec)
+            new_dims = [k * s for k, s in zip(x_padded.shape[2::2], stride)]
+            x_merged = x_padded.reshape(*x_padded.shape[:2], *new_dims)
+            shrink_spec = ((0, x_merged.shape[0]), (0, x_merged.shape[1]),
+                           *[(0, k - (s - 1)) for k, s in zip(x_merged.shape[2:], stride)])
+            x = x_merged.shrink(shrink_spec)
+
+        dilation_pair = make_pair(dilation, len(HW))
+        padding_pair = make_pair(padding, len(HW))
+        output_pad_pair = make_pair(output_padding, len(HW))
+        padding_calc = (((k - 1) * d - p, (k - 1) * d - p + op)
+                        for k, d, p, op in reversed(list(zip(HW, dilation_pair, padding_pair, output_pad_pair))))
+        padding = flatten(padding_calc)
+
+        w_merged = w.reshape(w.shape[0] * w.shape[1], *w.shape[2:])
+        return x.conv2d(w_merged, groups=groups, bias=bias, dilation=dilation, padding=padding)
+
+    wino = int(getenv("WINO", "0"))
+
+    def conv2d(self,
+               weight: Tensor,
+               bias: Optional[Tensor] = None,
+               groups=1,
+               stride=1,
+               dilation=1,
+               padding=0) -> Tensor:
+        bs, cin_ = self.shape[:2]
+        cout, cin = weight.shape[:2]
+        HW = weight.shape[2:]
+
+        assert groups * cin == cin_ and len(self.shape) == len(
+            weight.shape), f"Input Tensor shape {self.shape} does not match the shape of the weights {weight.shape}. ({groups * cin} vs. {cin_})"
+        if isinstance(padding, (tuple, list)):
+            assert len(padding) == 2 * len(HW) or len(padding) == len(
+                HW), f"Expected padding of length {2 * len(HW)} or {len(HW)}, but got {len(padding)} for tensor of shape {self.shape}"
+
+        if isinstance(padding, int):
+            padding_ = [padding] * 2 * len(HW)
+        elif len(padding) == 2 * len(HW):
+            padding_ = padding
+        else:
+            padding_ = [p for p in padding for _ in range(2)][::-1]
+
+        # conv2d is a pooling op (with padding)
+        x_padded = self.pad2d(padding_)
+        x = x_padded._pool(HW, stride, dilation)  # (bs, groups*cin, oy, ox, H, W)
+        rcout = cout // groups
+        oyx = x.shape[2:-len(HW)]
+
+        use_winograd = all(k == 3 for k in HW) and stride == 1 and dilation == 1 and Tensor.wino
+        if not use_winograd:
+            # normal conv
+            x_reshaped = x.reshape(bs, groups, cin, 1, *oyx, *HW)
+            x_expanded = x_reshaped.expand(bs, groups, cin, rcout, *oyx, *HW)
+            perm_order = [0, 1, 3, *[4 + i for i in range(len(oyx))], 2,
+                          *[4 + len(oyx) + i for i in range(len(HW))]]
+            x = x_expanded.permute(*perm_order)
+
+            # conv! broadcasted to (bs, groups, rcout, *oyx, cin, *HW)
+            w_reshaped = weight.reshape(1, groups, rcout, *[1] * len(oyx), cin, *HW)
+            multiplied = x * w_reshaped
+            sum_axes = [-1 - i for i in range(1 + len(oyx))]
+            summed = multiplied.sum(sum_axes, keepdim=True)
+            ret = summed.reshape(bs, cout, *oyx)
+
+            if bias is None:
+                return ret
+            else:
+                bias_reshaped = bias.reshape(1, -1, *[1] * len(HW))
+                return ret.add(bias_reshaped)
+
+        # winograd conv 3 kernel f(4x4,3x3) see: http://arxiv.org/abs/1509.09308
+
+        def apply_matrix(mat, t, dim=0):
+            if dim == len(HW):
+                return t
+            stacked = [apply_matrix(mat, sum(mm * t[j] for j, mm in enumerate(m) if mm), dim=dim + 1) for m in mat]
+            return Tensor.stack(stacked)
+
+        HWI, HWO = (6,) * len(HW), (4,) * len(HW)  # F(4x4,3x3) winograd tiles
+        winograd_Bt = [
+            [4, 0, -5, 0, 1, 0],
+            [0, -4, -4, 1, 1, 0],
+            [0, 4, -4, -1, 1, 0],
+            [0, -2, -1, 2, 1, 0],
+            [0, 2, -1, -2, 1, 0],
+            [0, 4, 0, -5, 0, 1]
+        ]
+        winograd_G = [
+            [1 / 4, 0, 0],
+            [-1 / 6, -1 / 6, -1 / 6],
+            [-1 / 6, 1 / 6, -1 / 6],
+            [1 / 24, 1 / 12, 1 / 6],
+            [1 / 24, -1 / 12, 1 / 6],
+            [0, 0, 1]
+        ]
+        winograd_At = [
+            [1, 1, 1, 1, 1, 0],
+            [0, 1, -1, 2, -2, 0],
+            [0, 1, 1, 4, 4, 0],
+            [0, 1, -1, 8, -8, 1]
+        ]  # applying At in pre-order almost doubles compilation time
+
+        # todo: stride == dilation
+        # use padding to round up to 4x4 output tiles
+        tile_pad = []
+        for i, dim in enumerate(self.shape[-len(HW):]):
+            left_pad = padding_[i * 2]
+            right_base = padding_[i * 2 + 1]
+            pad_sum = sum(padding_[i * 2:(i + 1) * 2])
+            extra_pad = (-(dim + pad_sum - 2) % 4)
+            right_pad = right_base + extra_pad
+            tile_pad.extend([left_pad, right_pad])
+
+        d_padded = self.pad2d(tile_pad)
+        d_pooled = d_padded._pool(HWI, HWO)  # (bs, cin_, tyx, HWI)
+        perm_front = list(range(len(d_pooled.shape) - len(HW), len(d_pooled.shape)))
+        perm_rest = list(range(len(d_pooled.shape) - len(HW)))
+        d = d_pooled.permute(*perm_front,
+                             *perm_rest).contiguous_backward()  # move HW to the front: (HWI, bs, cin_, tyx)
+        tyx = d.shape[-len(HWI):]  # dim of tiling
+
+        g_perm_front = list(range(len(weight.shape) - len(HW), len(weight.shape)))
+        g_perm_rest = list(range(len(weight.shape) - len(HW)))
+        g = weight.permute(*g_perm_front, *g_perm_rest)  # move HW to the front
+
+        # compute 6x6 winograd tiles: GgGt, BtdB
+        g_transformed = apply_matrix(winograd_G, g).contiguous()
+        gfactors = g_transformed.reshape(*HWI, 1, groups, rcout, cin, *(
+                    [1] * len(tyx)))  # (HWI, groups * rcout, cin) -> (HWI, bs=1, groups, rcout, cin, tyx=(1,1))
+
+        d_transformed = apply_matrix(winograd_Bt, d).contiguous()
+        dfactors = d_transformed.reshape(*HWI, bs, groups, 1, cin,
+                                         *tyx)  # (HWI, bs, cin_, tyx) -> (HWI, bs, groups, 1 ,cin, *tyx)
+
+        product = gfactors * dfactors
+        sum_axis = -1 - len(HW)
+        product_summed = product.sum(axis=sum_axis)
+        ret = apply_matrix(winograd_At,
+                           product_summed)  # matmul; sum across cin: (HWI, bs, groups, rcout, *tyx); then HWI -> HWO: (HWO, bs, groups, rcout, *tyx)
+
+        interleave_order = [*range(len(HW), len(ret.shape) - len(HW)),
+                            *[i + o for i in range(len(HW)) for o in [len(ret.shape) - len(HW), 0]]]
+        ret_permuted = ret.permute(interleave_order)  # interleave tyx and HWO: (bs, groups, rcout, oy, HO, ox, WO)
+
+        merged_shape = [bs, cout, *[c * HWO[i] for i, c in enumerate(tyx)]]
+        ret_merged = ret_permuted.reshape(*merged_shape)
+        shrink_spec = tuple((0, s) for s in [bs, cout, *oyx])
+        ret = ret_merged.shrink(
+            shrink_spec)  # merge groups and rcout, tyx and HWO: (bs, groups, cout, *yx), shrink to final
+
+        if bias is not None:
+            bias_reshaped = bias.reshape(1, -1, *[1 for _ in range(len(HW))])
+            ret = ret.add(bias_reshaped)
+
+        return ret.contiguous().contiguous_backward()
+
+    # ***** loss functions *****
 
     def binary_crossentropy(self, y: Tensor) -> Tensor:
         return (-y * self.log() - (1 - y) * (1 - self).log()).mean()
@@ -1358,7 +1471,7 @@ class Tensor:
         y = masked.reshape(*Y.shape, n_classes)
 
         log_probs = self.log_softmax()
-        weighted = log_probs.mul(y)
+        weighted = -log_probs.mul(y)
         total = weighted.sum()
         count = mask.sum()
         return total / count
