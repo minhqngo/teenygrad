@@ -129,8 +129,15 @@ class Add(Function):
         return x.e(BinaryOps.ADD, y)
 
     def backward(self, grad_output: LazyBuffer) -> Tuple[Optional[LazyBuffer], Optional[LazyBuffer]]:
-        return grad_output if self.needs_input_grad[0] else None, \
-            grad_output if self.needs_input_grad[1] else None
+        if self.needs_input_grad[0]:
+            grad_x = grad_output
+        else:
+            grad_x = None
+        if self.needs_input_grad[1]:
+            grad_y = grad_output
+        else:
+            grad_y = None
+        return grad_x, grad_y
 
 
 class Sub(Function):
@@ -138,8 +145,15 @@ class Sub(Function):
         return x.e(BinaryOps.SUB, y)
 
     def backward(self, grad_output: LazyBuffer) -> Tuple[Optional[LazyBuffer], Optional[LazyBuffer]]:
-        return grad_output if self.needs_input_grad[0] else None, \
-            grad_output.e(UnaryOps.NEG) if self.needs_input_grad[1] else None
+        if self.needs_input_grad[0]:
+            grad_x = grad_output
+        else:
+            grad_x = None
+        if self.needs_input_grad[1]:
+            grad_y = grad_output.e(UnaryOps.NEG)
+        else:
+            grad_y = None
+        return grad_x, grad_y
 
 
 class Mul(Function):
@@ -148,8 +162,15 @@ class Mul(Function):
         return x.e(BinaryOps.MUL, y)
 
     def backward(self, grad_output: LazyBuffer) -> Tuple[Optional[LazyBuffer], Optional[LazyBuffer]]:
-        return self.y.e(BinaryOps.MUL, grad_output) if self.needs_input_grad[0] else None, \
-            self.x.e(BinaryOps.MUL, grad_output) if self.needs_input_grad[1] else None
+        if self.needs_input_grad[0]:
+            grad_x = self.y.e(BinaryOps.MUL, grad_output)
+        else:
+            grad_x = None
+        if self.needs_input_grad[1]:
+            grad_y = self.x.e(BinaryOps.MUL, grad_output)
+        else:
+            grad_y = None
+        return grad_x, grad_y
 
 
 class Div(Function):
@@ -158,7 +179,10 @@ class Div(Function):
         return x.e(BinaryOps.DIV, y)
 
     def backward(self, grad_output: LazyBuffer) -> Tuple[Optional[LazyBuffer], Optional[LazyBuffer]]:
-        grad_x = grad_output.e(BinaryOps.DIV, self.y) if self.needs_input_grad[0] else None
+        if self.needs_input_grad[0]:
+            grad_x = grad_output.e(BinaryOps.DIV, self.y)
+        else:
+            grad_x = None
 
         if self.needs_input_grad[1]:
             neg_grad = grad_output.e(UnaryOps.NEG)
@@ -178,9 +202,15 @@ class Where(Function):
         return x.e(TernaryOps.WHERE, y, z)
 
     def backward(self, grad_output: LazyBuffer) -> Tuple[None, Optional[LazyBuffer], Optional[LazyBuffer]]:
-        return None, \
-            self.x.e(TernaryOps.WHERE, grad_output, grad_output.const(0)) if self.needs_input_grad[1] else None, \
-            self.x.e(TernaryOps.WHERE, grad_output.const(0), grad_output) if self.needs_input_grad[2] else None
+        if self.needs_input_grad[1]:
+            grad_y = self.x.e(TernaryOps.WHERE, grad_output, grad_output.const(0))
+        else:
+            grad_y = None
+        if self.needs_input_grad[2]:
+            grad_z = self.x.e(TernaryOps.WHERE, grad_output.const(0), grad_output)
+        else:
+            grad_z = None
+        return None, grad_y, grad_z
 
 # ************* reduce ops *************
 
@@ -262,7 +292,8 @@ class Shrink(Function):
 
 class Flip(Function):
     def forward(self, x: LazyBuffer, axis: Tuple[int, ...]) -> LazyBuffer:
-        self.arg = tuple([-1 if i in set(axis) else 1 for i in range(len(x.shape))])
+        axis_set = set(axis)
+        self.arg = tuple([-1 if i in axis_set else 1 for i in range(len(x.shape))])
         return x.stride(self.arg)
 
     def backward(self, grad_output: LazyBuffer) -> LazyBuffer:

@@ -68,8 +68,11 @@ class LazyBuffer:
     def const(self, x) -> LazyBuffer: 
         return LazyBuffer(np.full_like(self._np, x))
     
-    def cast(self, dtype: DType, bitcast: bool = False): 
-        return LazyBuffer(self._np.view(dtype.np) if bitcast else self._np.astype(dtype.np))
+    def cast(self, dtype: DType, bitcast: bool = False):
+        if bitcast:
+            return LazyBuffer(self._np.view(dtype.np))
+        else:
+            return LazyBuffer(self._np.astype(dtype.np))
     
     def e(self, op, *srcs: LazyBuffer):
         if DEBUG >= 1:

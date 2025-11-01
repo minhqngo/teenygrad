@@ -14,11 +14,17 @@ def dedup(x):
 
 
 def argfix(*x):
-    return tuple(x[0]) if x and x[0].__class__ in (tuple, list) else x
+    if x and x[0].__class__ in (tuple, list):
+        return tuple(x[0])
+    else:
+        return x
 
 
 def make_pair(x: Union[int, Tuple[int, ...]], cnt=2) -> Tuple[int, ...]:
-    return (x,) * cnt if isinstance(x, int) else x
+    if isinstance(x, int):
+        return (x,) * cnt
+    else:
+        return x
 
 
 def flatten(l: Iterator):
