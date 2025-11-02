@@ -1343,23 +1343,6 @@ class Tensor:
         else:
             return x
 
-    def rnn(self, W_ih: Tensor, W_hh: Tensor, b_ih: Tensor, b_hh: Tensor, h0: Optional[Tensor] = None) -> Tensor:
-        batch_size, seq_len, input_size = self.shape
-        hidden_size = W_hh.shape[0]
-
-        if h0 is None:
-            h = Tensor.zeros(batch_size, hidden_size, device=self.device, requires_grad=False)
-        else:
-            h = h0
-
-        outputs = []
-        for t in range(seq_len):
-            x_t = self[:, t, :].reshape(batch_size, input_size)
-            input_part = x_t.linear(W_ih, b_ih)
-            hidden_part = h.linear(W_hh, b_hh)
-            h = (input_part + hidden_part).tanh()
-            outputs.append(h.reshape(batch_size, 1, hidden_size))
-
         return outputs[0].cat(*outputs[1:], dim=1)
 
     def sequential(self, ll: List[Callable[[Tensor], Tensor]]):
