@@ -4,7 +4,7 @@ from teenygrad import Tensor
 from tqdm import trange
 import gzip, os
 
-from teenygrad.nn import optim
+from teenygrad.nn import optim, load_state_dict, safe_load, safe_save, get_state_dict
 from teenygrad.helpers import getenv, dtypes
 
 
@@ -31,7 +31,8 @@ def train(model,
         loss = lossfn(out, y.cast(dtype=dtypes.int8))
         optim.zero_grad()
         loss.backward()
-        if noloss: del loss
+        if noloss: 
+            del loss
         optim.step()
 
         # printing
@@ -109,3 +110,5 @@ if __name__ == "__main__":
     optimizer = optim.Adam([model.c1, model.c2, model.l1], lr=0.001)
     train(model, X_train, Y_train, optimizer, steps=100)
     assert evaluate(model, X_test, Y_test) > 0.93
+    model_state_dict = get_state_dict(model)
+    safe_save(model_state_dict, "mnist.safetensor")
